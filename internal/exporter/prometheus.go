@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/golang/glog"
 	"github.com/google/mtail/internal/metrics"
@@ -41,9 +42,12 @@ func (e *Exporter) Collect(c chan<- prometheus.Metric) {
 			return nil
 		}
 		metricExportTotal.Add(1)
+		glog.Infof("source= %s, name= %s, kind= %s, type= %s", m.Source, m.Name, m.Kind, m.Type)
 
 		lsc := make(chan *metrics.LabelSet)
 		go m.EmitLabelSets(lsc)
+		counter := 0
+		isGaugeArray := false
 		for ls := range lsc {
 			if lastMetric != m.Name {
 				glog.V(2).Infof("setting source to %s", m.Source)
@@ -52,13 +56,18 @@ func (e *Exporter) Collect(c chan<- prometheus.Metric) {
 			}
 			var keys []string
 			var vals []string
+			for k, v := range ls.Labels {
+				if m.Kind == metrics.Gauge && e.emitGaugeArray && strings.HasSuffix(k, "_gauge_index") {
+					// this label suffix is used to populate a Gauge array
+					isGaugeArray = true
+				} else {
+					keys = append(keys, k)
+					vals = append(vals, v)
+				}
+			}
 			if !e.omitProgLabel {
 				keys = append(keys, "prog")
 				vals = append(vals, m.Program)
-			}
-			for k, v := range ls.Labels {
-				keys = append(keys, k)
-				vals = append(vals, v)
 			}
 			var pM prometheus.Metric
 			var err error
@@ -71,6 +80,7 @@ func (e *Exporter) Collect(c chan<- prometheus.Metric) {
 					datum.GetBucketsCumByMax(ls.Datum),
 					vals...)
 			} else {
+				glog.Info("name= ", m.Name, ", isGaugeArray= ", isGaugeArray, ", counter= ", counter, ", kind= ", m.Kind)
 				pM, err = prometheus.NewConstMetric(
 					prometheus.NewDesc(noHyphens(m.Name),
 						fmt.Sprintf("defined at %s", lastSource), keys, nil),
@@ -87,11 +97,20 @@ func (e *Exporter) Collect(c chan<- prometheus.Metric) {
 			// if the timestamp is not updated or moved fowarded enough to avoid
 			// triggering Promtheus staleness handling.
 			// Read more in docs/faq.md
-			if e.emitTimestamp {
-				c <- prometheus.NewMetricWithTimestamp(ls.Datum.TimeUTC(), pM)
+			if e.emitTimestamp || isGaugeArray {
+				// use a new timestamp to emit the guage array, one by one
+				duration := time.Millisecond * time.Duration(counter)
+				timeUTC := ls.Datum.TimeUTC().Add(duration)
+				c <- prometheus.NewMetricWithTimestamp(timeUTC, pM)
 			} else {
 				c <- pM
 			}
+			counter++
+		}
+		glog.Info("metric= ", m.Name, ", chan= ", len(c), ", isGaugeArray= ", isGaugeArray, ", counter= ", counter)
+		// clean up the metric store
+		if isGaugeArray {
+			m.ClearGaugeDataLocked()
 		}
 		m.RUnlock()
 		return nil
